@@ -8,11 +8,12 @@
 #
 # Copyright (C) 2014-2016 Lin Song
 # Based on the work of Thomas Sarlandie (Copyright 2012)
+# Forked for adaptation to OVH/SoYouStart/Kimsufi dedicated servers by keijodputt
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
 # Unported License: http://creativecommons.org/licenses/by-sa/3.0/
 #
-# Attribution required: please include my name in any derivative and let me
+# Attribution required: please include Lin Song name in any derivative and let him
 # know how you have improved it!
 
 # ------------------------------------------------------------
@@ -26,7 +27,7 @@ VPN_USER='your_vpn_username'
 VPN_PASSWORD='your_very_secure_password'
 
 # Please read IMPORTANT NOTES at:
-# https://github.com/hwdsl2/setup-ipsec-vpn#important-notes
+# https://github.com/keijodputt/setup-ipsec-vpn#important-notes
 
 # ------------------------------------------------------------
 
@@ -62,17 +63,21 @@ if [ -z "$IPSEC_PSK" ] || [ -z "$VPN_USER" ] || [ -z "$VPN_PASSWORD" ]; then
   exit 1
 fi
 
+ipt="/sbin/iptables"
+# Failsafe - die if /sbin/iptables not found 
+[ ! -x "$ipt" ] && { echo "$0: \"${ipt}\" command not found."; exit 1; }
+
 # Create and change to working dir
 mkdir -p /opt/src
 cd /opt/src || exit 1
 
 # Update package index
 export DEBIAN_FRONTEND=noninteractive
-apt-get -y update
+apt -y update
 
 # Make sure basic commands exist
-apt-get -y install wget dnsutils
-apt-get -y install iproute gawk grep sed net-tools
+apt -y install wget dnsutils
+apt -y install iproute gawk grep sed net-tools
 
 echo
 echo 'Trying to find Public/Private IP of this server...'
@@ -106,17 +111,14 @@ if ! printf %s "$PRIVATE_IP" | grep -Eq "$IP_REGEX"; then
 fi
 
 # Install necessary packages
-apt-get -y install libnss3-dev libnspr4-dev pkg-config libpam0g-dev \
+apt -y install libnss3-dev libnspr4-dev pkg-config libpam0g-dev \
         libcap-ng-dev libcap-ng-utils libselinux1-dev \
         libcurl4-nss-dev flex bison gcc make \
         libunbound-dev libnss3-tools libevent-dev
-apt-get -y --no-install-recommends install xmlto
-apt-get -y install xl2tpd
+apt -y --no-install-recommends install xmlto
+apt -y install xl2tpd
 
-# Install Fail2Ban to protect SSH
-apt-get -y install fail2ban
-
-# Compile and install Libreswan
+# Wget, tweak, compile and install Libreswan. Check "SWAN_VER" for latest version
 SWAN_VER=3.17
 SWAN_FILE="libreswan-${SWAN_VER}.tar.gz"
 SWAN_URL="https://download.libreswan.org/$SWAN_FILE"
@@ -129,13 +131,15 @@ cd "libreswan-$SWAN_VER" || { echo "Cannot enter Libreswan source dir. Aborting.
 cat > Makefile.inc.local <<EOF
 WERROR_CFLAGS =
 EOF
+# Remove ghost ip_vti module from source. See https://lists.libreswan.org/pipermail/swan/2016/001557.html
+sed -e 's/ ip_vti//g' /opt/src/libreswan-$SWAN_VER/programs/_stackmanager/_stackmanager.in > /opt/src/libreswan-$SWAN_VER/programs/_stackmanager/_stackmanager.in
 make programs && make install
 
 # Check if Libreswan install was successful
 /usr/local/sbin/ipsec --version 2>/dev/null | grep -qs "$SWAN_VER"
 [ "$?" != "0" ] && { echo; echo "Libreswan $SWAN_VER failed to build. Aborting."; exit 1; }
 
-# Prepare various config files
+## Prepare various config files
 # Create IPsec (Libreswan) config
 SYS_DT="$(date +%Y-%m-%d-%H:%M:%S)"
 /bin/cp -f /etc/ipsec.conf "/etc/ipsec.conf.old-$SYS_DT" 2>/dev/null
@@ -257,12 +261,26 @@ net.ipv4.tcp_wmem = 10240 87380 12582912
 EOF
 fi
 
-# Create basic IPTables rules. First check if there are existing rules.
+## Create basic IPTables rules. First check if there are existing rules.
 # 1. If IPTables is "empty", write out the new set of rules.
 # 2. If *not* empty, insert new rules and save them together with existing ones.
+# 3. This script is heavily used in OVH servers. There are ports open for virtualization,
+# webmin, and some other specific apps. Delete the ones you don need/want.
 if ! grep -qs "hwdsl2 VPN script" /etc/iptables.rules; then
 /bin/cp -f /etc/iptables.rules "/etc/iptables.rules.old-$SYS_DT" 2>/dev/null
 service fail2ban stop >/dev/null 2>&1
+echo "Stopping firewall and allowing everyone..."
+$ipt -P INPUT ACCEPT
+$ipt -P FORWARD ACCEPT
+$ipt -P OUTPUT ACCEPT
+$ipt -F
+$ipt -X
+$ipt -t nat -F
+$ipt -t nat -X
+$ipt -t mangle -F
+$ipt -t mangle -X
+$ipt -t raw -F
+$ipt -t raw -X
 if [ "$(iptables-save | grep -c '^\-')" = "0" ]; then
 cat > /etc/iptables.rules <<EOF
 # Added by hwdsl2 VPN script
@@ -274,19 +292,38 @@ cat > /etc/iptables.rules <<EOF
 -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 -A INPUT -i lo -j ACCEPT
 -A INPUT -d 127.0.0.0/8 -j REJECT
+-A INPUT -i vmnet+ -j ACCEPT
 -A INPUT -p icmp -j ACCEPT
 -A INPUT -p udp --dport 67:68 --sport 67:68 -j ACCEPT
 -A INPUT -p tcp --dport 22 -j ACCEPT
+-A INPUT -p tcp --dport 80 -j ACCEPT
+-A INPUT -p tcp --dport 443 -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 3389 -j ACCEPT
+-A INPUT -p tcp --dport 8000:9000 -j ACCEPT
+-A INPUT -p tcp --dport 24333 -j ACCEPT
+-A INPUT -p tcp --dport 902 -j ACCEPT
+-A INPUT -p tcp --dport 10000 -j ACCEPT
+-A INPUT -p tcp --dport 20000 -j ACCEPT
+-A INPUT -p tcp --dport 24842 -j ACCEPT
 -A INPUT -p udp -m multiport --dports 500,4500 -j ACCEPT
 -A INPUT -p udp --dport 1701 -m policy --dir in --pol ipsec -j ACCEPT
+-A INPUT -p udp --dport 24842 -j ACCEPT
 -A INPUT -p udp --dport 1701 -j DROP
 -A INPUT -j DROP
 -A FORWARD -m conntrack --ctstate INVALID -j DROP
--A FORWARD -i eth+ -o ppp+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A FORWARD -i ppp+ -o eth+ -j ACCEPT
-# If you wish to allow traffic between VPN clients themselves, uncomment this line:
-# -A FORWARD -i ppp+ -o ppp+ -s 192.168.42.0/24 -d 192.168.42.0/24 -j ACCEPT
+-A FORWARD -i eth0 -o ppp+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -i ppp+ -o eth0 -j ACCEPT
+# If you wish to block traffic between VPN clients themselves, comment next line:
+-A FORWARD -i ppp+ -o ppp+ -s 192.168.50.0/24 -d 192.168.50.0/24 -j ACCEPT
 -A FORWARD -j DROP
+COMMIT
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s 192.168.50.0/24 -o eth+ -j SNAT --to-source "$PRIVATE_IP"
+COMMIT
 COMMIT
 *nat
 :PREROUTING ACCEPT [0:0]
@@ -305,7 +342,7 @@ iptables -I INPUT 3 -p udp --dport 1701 -j DROP
 iptables -I FORWARD 1 -m conntrack --ctstate INVALID -j DROP
 iptables -I FORWARD 2 -i eth+ -o ppp+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -I FORWARD 3 -i ppp+ -o eth+ -j ACCEPT
-# iptables -I FORWARD 4 -i ppp+ -o ppp+ -s 192.168.42.0/24 -d 192.168.42.0/24 -j ACCEPT
+iptables -I FORWARD 4 -i ppp+ -o ppp+ -s 192.168.42.0/24 -d 192.168.42.0/24 -j ACCEPT
 iptables -A FORWARD -j DROP
 iptables -t nat -I POSTROUTING -s 192.168.42.0/24 -o eth+ -j SNAT --to-source "$PRIVATE_IP"
 
@@ -391,10 +428,8 @@ iptables-restore < /etc/iptables.rules
 ip6tables-restore < /etc/ip6tables.rules >/dev/null 2>&1
 
 # Restart services
-service fail2ban stop >/dev/null 2>&1
 service ipsec stop >/dev/null 2>&1
 service xl2tpd stop >/dev/null 2>&1
-service fail2ban start
 service ipsec start
 service xl2tpd start
 
@@ -411,7 +446,7 @@ echo "Password: $VPN_PASSWORD"
 echo '============================================================'
 echo
 echo 'Please read IMPORTANT NOTES at:'
-echo 'https://github.com/hwdsl2/setup-ipsec-vpn#important-notes'
+echo 'https://github.com/keijodputt/setup-ipsec-vpn#important-notes'
 echo
 
 exit 0
